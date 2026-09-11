@@ -9,39 +9,29 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"image"
-	"image/color"
-	"image/png"
-	"bytes"
 	"syscall"
 	"time"
 
 	"github.com/example/stablediffusion"
-	"github.com/example/stablediffusion/bindings"
 )
 
-// 定义请求和响应结构
-type GenerateRequest struct {
-	Prompt            string  `json:"prompt"`
-	NegativePrompt    string  `json:"negative_prompt"`
-	Width             int     `json:"width"`
-	Height            int     `json:"height"`
-	Seed              int64   `json:"seed"`
-	Steps             int     `json:"steps"`
-	GuidanceScale     float32 `json:"guidance_scale"`
-	BatchCount        int     `json:"batch_count"`
-}
+// GenerateRequest 直接复用文生图接口的 Go 结构体参数
+type GenerateRequest = stablediffusion.Txt2ImgParams
 
 type GenerateResponse struct {
 	Images []ImageInfo `json:"images"`
-	Error  string      `json:"error,omitempty"`
+	// Seed 本次生成实际使用的基准种子（请求传负数时为服务端随机生成）
+	Seed  int64  `json:"seed,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 type ImageInfo struct {
-	Width   uint32 `json:"width"`
-	Height  uint32 `json:"height"`
-	Channel uint32 `json:"channel"`
-	Data    string `json:"data"` // Base64 encoded
+	Width  uint32 `json:"width"`
+	Height uint32 `json:"height"`
+	// Seed 生成该图像实际使用的种子
+	Seed   int64  `json:"seed"`
+	Format string `json:"format"`
+	Data   string `json:"data"` // Base64 编码的 PNG
 }
 
 // 全局变量
@@ -122,73 +112,42 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 设置默认值
-	if req.Width == 0 {
-		req.Width = 512
-	}
-	if req.Height == 0 {
-		req.Height = 512
-	}
-	if req.Steps == 0 {
-		req.Steps = 20
-	}
-	if req.GuidanceScale == 0 {
-		req.GuidanceScale = 7.5
-	}
-	if req.BatchCount == 0 {
-		req.BatchCount = 1
+	// 并发控制
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	default:
+		http.Error(w, "Server is busy", http.StatusServiceUnavailable)
+		return
 	}
 
-	// 创建生成配置
-	cfg := stablediffusion.GenerationConfig{
-		Prompt:         req.Prompt,
-		NegativePrompt: req.NegativePrompt,
-		Width:          req.Width,
-		Height:         req.Height,
-		Seed:           req.Seed,
-		BatchCount:     req.BatchCount,
-		Sampler: stablediffusion.SamplerConfig{
-			Scheduler:    bindings.KARRAS_SCHEDULER,
-			Method:       bindings.EULER_A_SAMPLE_METHOD,
-			Steps:        req.Steps,
-			TxtCfg:       req.GuidanceScale,
-			ImgCfg:       1.0,
-			DistilledCfg: 0.0,
-		},
-	}
-
-	// 生成图像，已经用 sem 保证了串行访问
-	images, err := sdCtx.GenerateImage(cfg)
-
+	// 调用文生图接口：默认值填充、参数校验、seed 处理、PNG 编码均在 Go 层完成
+	output, err := sdCtx.Txt2Img(req)
 	if err != nil {
-		response := GenerateResponse{
-			Error: fmt.Sprintf("Failed to generate image: %v", err),
-		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(GenerateResponse{
+			Error: fmt.Sprintf("Failed to generate image: %v", err),
+		})
 		return
 	}
 
 	// 转换为响应格式
-	imageInfos := make([]ImageInfo, len(images))
-	for i, img := range images {
-		// 将原始 RGB 数据转换为 PNG
-		pngData, err := encodeToPNG(img)
-		if err != nil {
-			log.Printf("Failed to encode image %d: %v", i, err)
-			continue
-		}
+	imageInfos := make([]ImageInfo, len(output.Images))
+	for i, img := range output.Images {
 		imageInfos[i] = ImageInfo{
-			Width:   img.Width,
-			Height:  img.Height,
-			Channel: img.Channel,
-			Data:    base64.StdEncoding.EncodeToString(pngData),
+			Width:  img.Width,
+			Height: img.Height,
+			Seed:   img.Seed,
+			Format: img.Format,
+			Data:   base64.StdEncoding.EncodeToString(img.Data),
 		}
 	}
 
 	// 返回响应
 	response := GenerateResponse{
 		Images: imageInfos,
+		Seed:   output.Seed,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
@@ -211,7 +170,7 @@ func main() {
 	// 注册路由
 	mux.HandleFunc("/health", healthCheckHandler)
 	mux.HandleFunc("/system-info", systemInfoHandler)
-	
+
 	// 给生成接口加上超时机制
 	generateTimeout := 5 * time.Minute
 	if t := os.Getenv("GENERATE_TIMEOUT"); t != "" {
@@ -219,7 +178,7 @@ func main() {
 			generateTimeout = d
 		}
 	}
-	
+
 	generateTimeoutHandler := http.TimeoutHandler(http.HandlerFunc(generateHandler), generateTimeout, `{"error":"Generation timeout"}`)
 	mux.Handle("/generate", generateTimeoutHandler)
 
@@ -262,38 +221,4 @@ func main() {
 	}
 
 	log.Println("Server exiting")
-}
-
-// 辅助函数：将原始 RGB 数据转换为 PNG
-func encodeToPNG(img *stablediffusion.Image) ([]byte, error) {
-	rect := image.Rect(0, 0, int(img.Width), int(img.Height))
-	rgba := image.NewRGBA(rect)
-
-	// 假设输入是 RGB (3 channels)
-	for y := 0; y < int(img.Height); y++ {
-		for x := 0; x < int(img.Width); x++ {
-			pos := (y*int(img.Width) + x) * int(img.Channel)
-			if int(img.Channel) == 3 {
-				rgba.SetRGBA(x, y, color.RGBA{
-					R: img.Data[pos],
-					G: img.Data[pos+1],
-					B: img.Data[pos+2],
-					A: 255,
-				})
-			} else if int(img.Channel) == 4 {
-				rgba.SetRGBA(x, y, color.RGBA{
-					R: img.Data[pos],
-					G: img.Data[pos+1],
-					B: img.Data[pos+2],
-					A: img.Data[pos+3],
-				})
-			}
-		}
-	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, rgba); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
